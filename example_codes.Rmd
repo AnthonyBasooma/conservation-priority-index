@@ -1,0 +1,153 @@
+---
+author: Anthony Basooma
+date: '`r format(Sys.Date())`'
+title: Novel index for site-based conservation
+subtitle: Conservation Priority index
+output:
+  html_document: default
+  #word_document: default
+keywords: Random forest, Africa biodiversity loss GBIF IUCN multiple stressors
+subject: Biodiversity conservation
+category: Priority-based conservation
+abstract: Funding biodiversity conservation strategies are usually minimal, thus prioritizing habitats at high risk should be conducted. We developed and tested a conservation priority index (CPI) that ranks habitats to aid in prioritizing them for conservation. We tested the index using 1897 fish species from 273 African inland lakes and 34 countries. In the index, lake surface area, rarity, and their International Union for Conservation of Nature (IUCN) Red List status were incorporated. Published in [Ecology and Evolution](https://doi.org/10.1002/ece3.8762)
+---
+
+```{r setup, include = FALSE, cache = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/PhD/applications/interviews/second round")
+```
+
+##Load libraries for use
+
+```{r, libraries, echo=TRUE, warning=FALSE, message=FALSE}
+
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(extrafont)
+library(data.table)
+library(randomForest)
+library(caret)
+library(xgboost)
+library(vegan)
+library(fastDummies)
+options(scipen = 999)
+options(dplyr.summarise.inform = FALSE)
+```
+* Pipe pass the output of one function into the other function as an argument like a conveyor belt, thus easy to read and debug
+* fread was used due to speed and memory efficiency compared to read.csv, read.table etc
+* Data used in this analysis can be found on my github [Anthony Basooma](https://github.com/AnthonyBasooma/conservation-priority-index)
+
+```{r, loaddata}
+#Load the species dataset
+rindexful = fread("indexdata.csv")|>
+  mutate(spno=1) |> filter(!wbody%in%c("Not Known"), nature%in%c("Lakes"),
+                          !is.na(species), !bor%in%c("FS"), !is.na(area),
+                          !species%in%c("Haplochromis sp", "Pundamilia sp",
+                                        "Thoracochromis sp", "Neochromis sp",
+                                        "Lithochromis.sp","Paralabidochromis sp",
+                                        "Prognathochromis sp", "Lithochromis sp"))
+```
+
+
+* Species accumulation curve for the lakes and species in Africa
+#, fig.show='hide'
+
+```{r, species_accumualtion_curve, cache=TRUE}
+spacm <- rindexful|>group_by(wbody, species)|>summarise(spsum = sum(spno))|>
+  spread("species", "spsum", fill = 0)|>ungroup()|>select(2:1898)|>
+  specaccum(spacum, method = "rarefaction")
+
+#species accumulation curve
+spcurve<- data.frame(spacm[c("richness", "sd", "sites")])
+ggplot(spcurve, aes(x=sites, y=richness))+
+  geom_line()+
+  theme_bw()+
+  geom_linerange(aes(ymin=richness-sd, ymax=richness+sd))+
+  theme(text = element_text(family = "Cambria", size = 13))+
+  labs(y="Species richness", x="Waterbodies", linetype="Species groups")
+
+```
+* Examine the lake's species richness (richness), lakes in a country (totlakes)
+* Summaries for country area, number of lakes
+
+```{r, countrywaterbodies and richness}
+lakescountry <- rindexful|>group_by(ctry, nature, area, lakes, code)|>
+  summarise(richness= sum(spno))|>
+  mutate(wb=1)|>group_by(ctry)|>mutate(totlakes=sum(wb))|>ungroup()|>
+  select(lakes, totlakes, area, code)
+```
+
+* occurrences: number of species records in a particular country and lake
+* speciesfreq: number of lakes where the species is found
+* speciesrarity: the endemicity of a species (proportion of lakes inhabited by a species)
+* cpical: conservation priority index calculation
+* cpisum: summaries for the index including the parameters used
+
+```{r}
+cpical   <-  rindexful|>group_by(nature, ctry, lakes, species, iucn)|>
+  summarise(occurences = length(spno))|>
+  mutate(sp=1, iucnwt = case_when(iucn=="CR"~5, 
+                                  iucn=="EN"~4, 
+                                  iucn=="VU"~3,
+                                  iucn=="NT"~2, 
+                                  iucn=="LC"~1, 
+                                  iucn=="DD"~5,
+                                  iucn=="NE"~5, 
+                                  iucn=="EX"~7))|>
+  group_by(nature, ctry,species)|>mutate(speciesfreq= sum(sp))|>
+  left_join(y=lakescountry, by=c('lakes'='lakes'))|>
+  mutate(speciesrarity= 1-(speciesfreq/totlakes), nominator = speciesrarity*iucnwt)|>
+  group_by(ctry, lakes)|>
+  mutate(sum_nominator= sum(nominator), cpi= sum_nominator/(area*8))
+
+cpisum <-  cpical|>group_by(ctry, lakes)|>
+  summarise(richness = sum(sp),sarea = mean(area), wt = sum(iucnwt), code = mean(code),
+            rare = sum(speciesrarity),pi= mean(cpi))|>mutate(cts =1)
+```
+
+* Modelling of the CPI parameters to examine the variable importance
+* CPI classified where CPI>=0.5 = "1" and CPI<0.5~"0"
+
+```{r}
+modeldata <- cpisum|>
+  mutate(pclass = case_when(pi>=0.5~"1", pi<0.5~"0"),
+         pclass = as.factor(pclass), code=as.factor(code))
+
+
+#Random forest classification
+set.seed(1135)
+
+dummydata <- dummy_columns(modeldata, select_columns = 'code')
+modeldata_final <- dummydata|>select(-c(code, 1,2, 3, cts, pi))
+
+
+ind <- sample(2, nrow(modeldata_final), replace = TRUE, prob = c(0.7, 0.3))
+
+train <- as.data.frame(modeldata_final[ind==1,])
+test <- as.data.frame(modeldata_final[ind==2,])
+
+rf <- randomForest(pclass~., ntree = 120, mtry = 4, importance = TRUE,
+                   proximity = TRUE, data = train) #variables sqrt 4
+
+print(rf)
+
+rf$confusion
+
+predict_train <- predict(rf, train)
+
+confusionMatrix(predict_train, train$pclass)
+
+#===========================================================================
+#prediction with test data
+predict_test <- predict(rf, test)
+confusionMatrix(predict_test, test$pclass)
+plot(rf)
+
+#=================
+varImpPlot(rf,
+           sort = T, 
+           main = "Random Forest",
+           n.var = 4)
+```
